@@ -12,6 +12,7 @@ Uso:
 """
 import argparse
 import base64
+import csv
 import logging
 import re
 import sys
@@ -66,8 +67,24 @@ CLASES_OVERFLOW = ("NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsl
 URL_SELENIUM = "http://portaldistribuidores.tim.com.pe:1616/SitePages/inicio.aspx"
 TEXTO_OPCION = "SIAC Unico"   # opción a buscar y clicar dentro del portal
 TIPO_BUSQUEDA = "Documento Identidad"   # opción del desplegable de búsqueda en SIAC Único
-VALOR_BUSQUEDA = ""           # qué buscar (ej. un DNI). Vacío = no busca nada
+VALOR_BUSQUEDA = ""           # un solo valor. Vacío = itera el Excel de abajo
+# Excel con los valores a buscar (en la misma carpeta que este script)
+ARCHIVO_VALORES = "RUCS_PORTA_20MAS_100.xlsx"
+COLUMNA_VALORES = None        # None = autodetecta (RUC/documento/DNI); o el nombre o índice de la columna
+HOJA_VALORES = 0              # índice o nombre de la hoja
+PAUSA_ENTRE_BUSQUEDAS = 3     # segundos entre una búsqueda y la siguiente
+# Popup "Consulta de Productos" que sale al presionar la lupa
+TIMEOUT_POPUP = 60            # segundos esperando que aparezca el popup
+REGEX_POPUP = re.compile(r"popup|consulta de productos", re.I)
+TIMEOUT_DATOS = 30            # segundos esperando que el popup termine de pintar sus tablas
+ESPERA_DATOS = 2              # segundos entre lectura y lectura del popup
+CLIC_EN_TOTAL_ACTIVAS = True  # tras leer los totales, clic en el número de activas (abre otro popup)
+ARCHIVO_CSV = "resultado_rucs.csv"
+# El total se repite en cada producto de la misma cuenta: True lo cuenta una sola vez
+AGRUPAR_POR_CUENTA = True
 TIMEOUT_WEB = 40              # segundos esperando la carga del portal / la opción
+TIMEOUT_VENTANA_SIAC = 30     # segundos esperando que SIAC abra su ventana nueva
+REGEX_VENTANA_SIAC = re.compile(r"siac", re.I)   # título o URL de la ventana de SIAC
 # Dominios donde Edge puede usar tu sesión de Windows (evita el popup de usuario/contraseña)
 AUTH_ALLOWLIST = "*tim.com.pe,portaldistribuidores.tim.com.pe"
 # Credenciales del portal: por defecto reutiliza las mismas de la VPN
@@ -625,6 +642,396 @@ def buscar_en_siac(driver, valor=VALOR_BUSQUEDA):
     return True
 
 
+def leer_valores(ruta=ARCHIVO_VALORES, columna=COLUMNA_VALORES, hoja=HOJA_VALORES):
+    """Lee el Excel y devuelve los valores a buscar, sin vacíos ni duplicados."""
+    from openpyxl import load_workbook
+
+    archivo = Path(ruta)
+    if not archivo.exists():                       # por si el nombre vino sin extensión
+        candidatos = sorted(Path(".").glob(archivo.stem + ".xls*"))
+        if not candidatos:
+            raise RuntimeError(f"No encontré '{ruta}' en {Path('.').resolve()}")
+        archivo = candidatos[0]
+
+    wb = load_workbook(archivo, read_only=True, data_only=True)
+    ws = wb[hoja] if isinstance(hoja, str) else wb.worksheets[hoja]
+    filas = ws.iter_rows(values_only=True)
+    cabecera = ["" if c is None else str(c).strip() for c in next(filas, ())]
+
+    if isinstance(columna, int):
+        idx = columna
+    elif columna:
+        idx = cabecera.index(columna)
+    else:
+        idx = next((i for i, h in enumerate(cabecera) if re.search(r"ruc|documento|dni", h, re.I)), None)
+        if idx is None:
+            idx = 0
+            log.warning("[8/8] No identifiqué la columna; uso la primera. Encabezados: %s",
+                        ", ".join(cabecera) or "(ninguno)")
+
+    def limpiar(v):
+        v = str(v).strip()
+        return v[:-2] if v.endswith(".0") else v    # openpyxl devuelve los números como 20123456789.0
+
+    valores, vistos = [], []
+    primera = cabecera[idx] if idx < len(cabecera) else ""
+    if primera.replace(" ", "").isdigit() and len(primera) >= 8:
+        valores.append(limpiar(primera))            # el archivo no tenía encabezados
+
+    for fila in filas:
+        if idx >= len(fila) or fila[idx] is None:
+            continue
+        v = limpiar(fila[idx])
+        if v and v not in vistos:
+            vistos.append(v)
+            valores.append(v)
+    wb.close()
+
+    log.info("[8/8] %s: %d valores en la columna %r", archivo.name, len(valores),
+             cabecera[idx] if idx < len(cabecera) else idx)
+    return valores
+
+
+def _valor_celda(celda):
+    """El número puede venir dentro de un <input> o como texto plano."""
+    inputs = celda.find_elements(By.TAG_NAME, "input")
+    if inputs:
+        return (inputs[0].get_attribute("value") or "").strip()
+    return celda.text.strip()
+
+
+def _a_entero(texto):
+    digitos = re.sub(r"[^0-9]", "", texto or "")
+    return int(digitos) if digitos else None
+
+
+def esperar_popup(driver, handles_antes, timeout=TIMEOUT_POPUP):
+    """Devuelve el handle del popup de resultados, o None si no apareció."""
+    fin = time.time() + timeout
+    nuevo = None
+    while time.time() < fin:
+        for h in driver.window_handles:
+            if h in handles_antes:
+                continue
+            try:
+                driver.switch_to.window(h)
+                nuevo = h
+                if REGEX_POPUP.search(driver.current_url) or REGEX_POPUP.search(driver.title or ""):
+                    log.info("[8/8] Popup detectado: %s", driver.current_url)
+                    return h
+            except Exception:
+                continue          # todavía abriendo o ya se cerró
+        time.sleep(1)
+
+    if nuevo and nuevo in driver.window_handles:
+        log.info("[8/8] Ventana nueva sin el patrón esperado; la uso igual.")
+        return nuevo
+    return None
+
+
+def _leer_tablas(driver):
+    """Una pasada sobre las tablas del popup: [(clave_cuenta, activas, no_activas), ...]."""
+    filas_datos = []
+    for i, tabla in enumerate(driver.find_elements(By.TAG_NAME, "table")):
+        try:
+            cabecera = [_normaliza(" ".join(th.text.split()))
+                        for th in tabla.find_elements(By.TAG_NAME, "th")]
+        except Exception:
+            continue
+
+        i_act = next((j for j, h in enumerate(cabecera) if "total activas" in h), None)
+        i_no = next((j for j, h in enumerate(cabecera) if "total no activas" in h), None)
+        if i_act is None or i_no is None:
+            continue                       # no es una tabla de servicios
+        i_cta = next((j for j, h in enumerate(cabecera) if "cuenta" in h), None)
+
+        for fila in tabla.find_elements(By.XPATH, ".//tbody/tr"):
+            celdas = fila.find_elements(By.TAG_NAME, "td")
+            if len(celdas) <= max(i_act, i_no):
+                continue
+            act = _a_entero(_valor_celda(celdas[i_act]))
+            no = _a_entero(_valor_celda(celdas[i_no]))
+            if act is None and no is None:
+                continue
+            cuenta = _valor_celda(celdas[i_cta]) if i_cta is not None else str(len(filas_datos))
+            filas_datos.append((f"{i}|{cuenta}", act or 0, no or 0))
+
+    return filas_datos
+
+
+def extraer_totales(driver, timeout=TIMEOUT_DATOS):
+    """Espera a que el popup termine de cargar sus tablas y recién ahí las lee.
+
+    Relee cada pocos segundos: da por buena la lectura cuando dos pasadas seguidas
+    devuelven la misma cantidad de filas, así no lee una tabla a medio pintar.
+    """
+    _esperar_carga(driver)
+    log.info("[8/8] Esperando los datos del popup (hasta %s s)...", timeout)
+
+    fin = time.time() + timeout
+    filas, previas = [], -1
+    while time.time() < fin:
+        filas = _leer_tablas(driver)
+        if filas and len(filas) == previas:
+            log.info("[8/8] Datos completos: %d filas de servicios.", len(filas))
+            return filas
+        if filas:
+            log.info("[8/8] Cargando... %d filas hasta ahora.", len(filas))
+        previas = len(filas)
+        time.sleep(ESPERA_DATOS)
+
+    if filas:
+        log.warning("[8/8] Se agotó el tiempo; me quedo con las %d filas leídas.", len(filas))
+    return filas
+
+
+def elementos_activas(driver, solo_positivos=True):
+    """Los campos 'Total Activas' del popup, para hacerles clic: [(elemento, valor), ...]."""
+    objetivos = []
+    for tabla in driver.find_elements(By.TAG_NAME, "table"):
+        try:
+            cabecera = [_normaliza(" ".join(th.text.split()))
+                        for th in tabla.find_elements(By.TAG_NAME, "th")]
+        except Exception:
+            continue
+        i_act = next((j for j, h in enumerate(cabecera)
+                      if "total activas" in h and "no activas" not in h), None)
+        if i_act is None:
+            continue
+        for fila in tabla.find_elements(By.XPATH, ".//tbody/tr"):
+            celdas = fila.find_elements(By.TAG_NAME, "td")
+            if len(celdas) <= i_act:
+                continue
+            celda = celdas[i_act]
+            valor = _a_entero(_valor_celda(celda)) or 0
+            if solo_positivos and valor <= 0:
+                continue                      # un 0 no tiene detalle que mostrar
+            campos = celda.find_elements(By.TAG_NAME, "input")
+            objetivos.append((campos[0] if campos else celda, valor))
+    return objetivos
+
+
+def inspeccionar_popup(driver, max_filas=3):
+    """Registra en el log qué trae el popup: título, columnas y primeras filas."""
+    log.info("[8/8] Detalle -> %r | %s", driver.title, driver.current_url)
+    for i, tabla in enumerate(driver.find_elements(By.TAG_NAME, "table")):
+        try:
+            cabecera = [" ".join(th.text.split()) for th in tabla.find_elements(By.TAG_NAME, "th")]
+            filas = tabla.find_elements(By.XPATH, ".//tbody/tr")
+        except Exception:
+            continue
+        if not cabecera and not filas:
+            continue
+        log.info("[8/8]   tabla %d (%d filas): %s", i, len(filas), " | ".join(cabecera) or "(sin encabezados)")
+        for fila in filas[:max_filas]:
+            celdas = [_valor_celda(c) for c in fila.find_elements(By.TAG_NAME, "td")]
+            if any(celdas):
+                log.info("[8/8]     %s", " | ".join(celdas))
+
+
+def abrir_detalle_activas(driver, handle_popup):
+    """Clic en el número de Total Activas; devuelve el handle del segundo popup."""
+    objetivos = elementos_activas(driver)
+    if not objetivos:
+        log.info("[8/8] Ninguna fila con activas > 0; no hay detalle que abrir.")
+        return None
+
+    elemento, valor = objetivos[0]
+    handles_antes = driver.window_handles
+    log.info("[8/8] Clic en Total Activas = %d (de %d filas con activas)...", valor, len(objetivos))
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elemento)
+    time.sleep(0.5)
+    try:
+        elemento.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", elemento)
+
+    detalle = esperar_popup(driver, handles_antes)
+    if detalle is None:
+        log.warning("[8/8] El clic no abrió un segundo popup.")
+        try:
+            driver.switch_to.window(handle_popup)
+        except Exception:
+            pass
+        return None
+
+    driver.switch_to.window(detalle)
+    _esperar_carga(driver)
+    time.sleep(ESPERA_DATOS)
+    inspeccionar_popup(driver)
+    return detalle
+
+
+def sumar_totales(filas):
+    """Suma activas y no activas; agrupa por cuenta para no contar dos veces el mismo total."""
+    if AGRUPAR_POR_CUENTA:
+        por_cuenta = {}
+        for clave, act, no in filas:
+            por_cuenta[clave] = (act, no)
+        pares = list(por_cuenta.values())
+    else:
+        pares = [(act, no) for _, act, no in filas]
+    return sum(a for a, _ in pares), sum(n for _, n in pares)
+
+
+def cerrar_popup(driver, handle_popup, handle_siac):
+    """Clic en Cerrar; si no aparece el botón, cierra la ventana directamente."""
+    try:
+        xp = (_xpath_texto(("button", "a", "span"), "cerrar") +
+              " | //input[contains(translate(@value,'CERRAR','cerrar'),'cerrar')]")
+        botones = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
+        if botones:
+            log.info("[8/8] Cerrando el popup con el botón Cerrar.")
+            try:
+                botones[0].click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", botones[0])
+            time.sleep(1.5)
+    except Exception as e:
+        log.debug("Botón Cerrar no utilizable: %s", e)
+
+    if handle_popup in driver.window_handles:      # el botón no la cerró
+        try:
+            driver.switch_to.window(handle_popup)
+            driver.close()
+            log.info("[8/8] Popup cerrado por el navegador.")
+        except Exception:
+            pass
+
+    try:
+        driver.switch_to.window(handle_siac)
+    except Exception:
+        vivas = _ventanas_vivas(driver)
+        if vivas:
+            driver.switch_to.window(vivas[-1][0])
+
+
+def guardar_fila_csv(ruc, activas, no_activas, ruta=ARCHIVO_CSV):
+    archivo = Path(ruta)
+    nuevo = not archivo.exists()
+    with open(archivo, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if nuevo:
+            w.writerow(["ruc", "nro total activas", "nro total no activas"])
+        w.writerow([ruc, activas, no_activas])
+
+
+def buscar_lote(driver, valores=None):
+    """Busca en SIAC cada valor del Excel, uno tras otro."""
+    valores = leer_valores() if valores is None else valores
+    if not valores:
+        log.warning("[8/8] El Excel no tiene valores que buscar.")
+        return
+
+    url_siac = driver.current_url
+    handle_siac = driver.current_window_handle
+    total = len(valores)
+    log.info("[8/8] Lote de %d búsquedas. Resultados -> %s", total, Path(ARCHIVO_CSV).resolve())
+
+    for i, valor in enumerate(valores, 1):
+        log.info("[8/8] (%d/%d) --- %s ---", i, total, valor)
+        try:
+            handles_antes = driver.window_handles
+            buscar_en_siac(driver, valor)
+
+            popup = esperar_popup(driver, handles_antes)
+            if popup is None:
+                log.warning("[8/8] (%d/%d) %s: no apareció el popup en %s s.", i, total, valor, TIMEOUT_POPUP)
+                guardar_fila_csv(valor, "", "")
+            else:
+                driver.switch_to.window(popup)
+                filas = extraer_totales(driver)
+                if filas:
+                    activas, no_activas = sumar_totales(filas)
+                    log.info("[8/8] (%d/%d) %s -> activas=%d, no activas=%d (%d filas)",
+                             i, total, valor, activas, no_activas, len(filas))
+                    guardar_fila_csv(valor, activas, no_activas)
+                    if CLIC_EN_TOTAL_ACTIVAS:
+                        detalle = abrir_detalle_activas(driver, popup)
+                        if detalle:
+                            cerrar_popup(driver, detalle, popup)   # cierro el detalle, vuelvo al 1er popup
+                else:
+                    log.info("[8/8] (%d/%d) %s: el popup vino vacío.", i, total, valor)
+                    guardar_fila_csv(valor, "", "")
+                cerrar_popup(driver, popup, handle_siac)
+
+        except Exception as e:
+            log.warning("[8/8] (%d/%d) %s falló: %s. Recargo SIAC y sigo.", i, total, valor, e)
+            guardar_fila_csv(valor, "ERROR", "ERROR")
+            try:
+                for h in driver.window_handles:      # cierro popups que hayan quedado sueltos
+                    if h != handle_siac:
+                        driver.switch_to.window(h)
+                        driver.close()
+                driver.switch_to.window(handle_siac)
+                driver.get(url_siac)
+                _esperar_carga(driver)
+                seleccionar_tipo_busqueda(driver)
+            except Exception as e2:
+                log.error("[8/8] No pude recuperar la sesión: %s. Corto el lote.", e2)
+                break
+        time.sleep(PAUSA_ENTRE_BUSQUEDAS)
+
+    log.info("[8/8] Lote terminado (%d valores). CSV: %s", total, Path(ARCHIVO_CSV).resolve())
+
+
+def _ventanas_vivas(driver):
+    """(handle, título, url) de las ventanas que todavía responden."""
+    vivas = []
+    for h in driver.window_handles:
+        try:
+            driver.switch_to.window(h)
+            vivas.append((h, driver.title or "", driver.current_url or ""))
+        except Exception:
+            continue          # se cerró mientras la consultaba
+    return vivas
+
+
+def ir_a_ventana_siac(driver, pestanas_antes, timeout=TIMEOUT_VENTANA_SIAC):
+    """Se cambia a la ventana de SIAC, tolerando popups que se abren y se cierran."""
+    fin = time.time() + timeout
+    nueva = None
+    while time.time() < fin:
+        vivas = _ventanas_vivas(driver)
+        for h, titulo, url in vivas:
+            if REGEX_VENTANA_SIAC.search(url) or REGEX_VENTANA_SIAC.search(titulo):
+                driver.switch_to.window(h)
+                log.info("[7/8] Ventana de SIAC: %r -> %s", titulo, url)
+                return True
+        nuevas = [v for v in vivas if v[0] not in pestanas_antes]
+        if nuevas:
+            nueva = nuevas[-1]     # existe pero aún no resuelve su URL
+        time.sleep(1)
+
+    vivas = _ventanas_vivas(driver)
+    if not vivas:
+        raise RuntimeError("Se cerraron todas las ventanas del navegador.")
+
+    if nueva and any(v[0] == nueva[0] for v in vivas):
+        driver.switch_to.window(nueva[0])
+        log.warning("[7/8] Uso la ventana nueva %r; no confirmé que sea SIAC.", nueva[1])
+        return False
+
+    log.warning("[7/8] No apareció la ventana de SIAC en %s s. Ventanas vivas:", timeout)
+    for _, titulo, url in vivas:
+        log.warning("[7/8]   %r -> %s", titulo, url)
+    driver.switch_to.window(vivas[-1][0])
+    return False
+
+
+def _esperar_carga(driver, timeout=TIMEOUT_WEB):
+    """readyState == complete. False si la ventana murió (no lanza excepción)."""
+    fin = time.time() + timeout
+    while time.time() < fin:
+        try:
+            if driver.execute_script("return document.readyState") == "complete":
+                return True
+        except Exception:
+            return False
+        time.sleep(0.5)
+    return False
+
+
 def clic_opcion_portal(driver, texto=TEXTO_OPCION):
     """Busca la opción (enlace, botón o texto) dentro del portal y le hace clic."""
     # Normaliza a minúsculas y sin tildes para comparar (el portal escribe "Unico" y "Único")
@@ -659,22 +1066,26 @@ def clic_opcion_portal(driver, texto=TEXTO_OPCION):
     except Exception:
         driver.execute_script("arguments[0].click();", el)  # por si algo la tapa
 
-    time.sleep(2)
-    if len(driver.window_handles) > len(pestanas_antes):
-        driver.switch_to.window(driver.window_handles[-1])  # SIAC abrió en otra pestaña
-        log.info("[7/8] SIAC abrió en una ventana nueva.")
+    ir_a_ventana_siac(driver, pestanas_antes)
 
     # SIAC pide autenticación otra vez (es otra aplicación tras el portal)
     time.sleep(2)
     esperar_credenciales_usuario(driver)
 
-    WebDriverWait(driver, TIMEOUT_WEB).until(
-        lambda d: d.execute_script("return document.readyState") == "complete")
+    if not _esperar_carga(driver):
+        # El popup intermedio se cerró al redirigir: busco la ventana definitiva
+        log.warning("[7/8] La ventana se cerró mientras cargaba; busco la de SIAC otra vez.")
+        ir_a_ventana_siac(driver, pestanas_antes)
+        esperar_credenciales_usuario(driver)
+        _esperar_carga(driver)
     log.info("[7/8] SIAC listo: %s", driver.current_url)
 
     time.sleep(2)                       # que SIAC termine de pintar la barra de búsqueda
     seleccionar_tipo_busqueda(driver)
-    buscar_en_siac(driver)
+    if VALOR_BUSQUEDA:
+        buscar_en_siac(driver, VALOR_BUSQUEDA)     # override: un solo valor
+    else:
+        buscar_lote(driver)                        # itera el Excel
 
 
 def _credenciales_portal():
@@ -848,8 +1259,7 @@ def flujo_portal(url=URL_SELENIUM, opcion=TEXTO_OPCION):
     driver = abrir_selenium(url, navegar=False)
     driver.get(url)                        # con pageLoadStrategy 'none' vuelve enseguida
     esperar_credenciales_usuario(driver)
-    WebDriverWait(driver, TIMEOUT_WEB).until(
-        lambda d: d.execute_script("return document.readyState") == "complete")
+    _esperar_carga(driver)
     log.info("[6/8] Portal listo: %s", driver.current_url)
     clic_opcion_portal(driver, opcion)
     return driver
