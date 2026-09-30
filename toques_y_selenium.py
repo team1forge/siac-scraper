@@ -24,6 +24,7 @@ import psutil
 from pywinauto import Desktop
 from pywinauto.keyboard import send_keys
 from selenium import webdriver
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -69,19 +70,26 @@ TEXTO_OPCION = "SIAC Unico"   # opción a buscar y clicar dentro del portal
 TIPO_BUSQUEDA = "Documento Identidad"   # opción del desplegable de búsqueda en SIAC Único
 VALOR_BUSQUEDA = ""           # un solo valor. Vacío = itera el Excel de abajo
 # Excel con los valores a buscar (en la misma carpeta que este script)
-ARCHIVO_VALORES = "RUCS_PORTA_20MAS_100.xlsx"
+ARCHIVO_VALORES = "80k.xlsx"
 COLUMNA_VALORES = None        # None = autodetecta (RUC/documento/DNI); o el nombre o índice de la columna
 HOJA_VALORES = 0              # índice o nombre de la hoja
 PAUSA_ENTRE_BUSQUEDAS = 3     # segundos entre una búsqueda y la siguiente
 # Popup "Consulta de Productos" que sale al presionar la lupa
 TIMEOUT_POPUP = 60            # segundos esperando que aparezca el popup
 REGEX_POPUP = re.compile(r"popup|consulta de productos", re.I)
+# Popup de "Alerta" (ej. "Usted no está autorizado para consultar este tipo de producto"):
+# se acepta, el RUC se guarda con datos vacíos y se pasa al siguiente
+REGEX_ALERTA = re.compile(r"no est[aá] autorizad|^\s*alerta\s*$", re.I | re.M)
+TIMEOUT_CIERRE_ALERTA = 15    # segundos esperando que la alerta se cierre tras el clic en Aceptar
 TIMEOUT_DATOS = 30            # segundos esperando que el popup termine de pintar sus tablas
 ESPERA_DATOS = 2              # segundos entre lectura y lectura del popup
 CLIC_EN_TOTAL_ACTIVAS = True  # tras leer los totales, clic en el número de activas (abre otro popup)
-ARCHIVO_CSV = "resultado_rucs.csv"
-# El total se repite en cada producto de la misma cuenta: True lo cuenta una sola vez
-AGRUPAR_POR_CUENTA = True
+TIMEOUT_BOTON_TOTAL = 15      # segundos esperando que el recuadro Total Activas / No Activas esté clicable
+ESPERA_POPUP_DETALLE = 10     # segundos esperando el popup de líneas tras cada intento de clic
+# Título del detalle de líneas (puede abrirse en ventana nueva o dentro del mismo popup)
+REGEX_DETALLE = re.compile(r"l[ií]neas asociadas", re.I)
+ESPERA_TRAS_NUMERO = 5        # segundos en SIAC después de clicar el primer número del detalle
+ARCHIVO_CSV = "resultado_rucs.csv"    # columnas: ruc + CAMPOS_CLIENTE
 TIMEOUT_WEB = 40              # segundos esperando la carga del portal / la opción
 TIMEOUT_VENTANA_SIAC = 30     # segundos esperando que SIAC abra su ventana nueva
 REGEX_VENTANA_SIAC = re.compile(r"siac", re.I)   # título o URL de la ventana de SIAC
@@ -95,7 +103,9 @@ REGEX_DIALOGO_WEB = re.compile(r"(Seguridad de Windows|Windows Security|Iniciar 
 NAVEGADOR = "chrome"          # "chrome" o "edge"
 # Perfil dedicado para conservar cookies/sesión (SSO) entre ejecuciones. None = perfil temporal
 PERFIL_DIR = Path(f"./perfil_{NAVEGADOR}").resolve()
-MANTENER_ABIERTO = True       # deja el navegador abierto al terminar el script
+MANTENER_ABIERTO = False      # True = deja el navegador abierto al terminar el script
+DESCONECTAR_VPN_AL_TERMINAR = True   # al terminar, desconecta la VPN (solo si la conectó este script)
+REGEX_BOTON_CONFIRMAR = re.compile(r"^\s*(S[ií]|Yes|Aceptar|OK)\s*$", re.I)
 # ================================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -444,6 +454,8 @@ def capturar_coords_ivanti():
 
 
 # -------------------------- Selenium --------------------------
+_driver_activo = None                     # el navegador abierto por abrir_selenium()
+
 def abrir_selenium(url=URL_SELENIUM, navegar=True):
     if NAVEGADOR == "edge":
         opts = webdriver.EdgeOptions()
@@ -463,7 +475,9 @@ def abrir_selenium(url=URL_SELENIUM, navegar=True):
         opts.add_experimental_option("detach", True)
 
     # Selenium 4.6+ descarga el driver solo (Selenium Manager)
+    global _driver_activo
     driver = webdriver.Edge(options=opts) if NAVEGADOR == "edge" else webdriver.Chrome(options=opts)
+    _driver_activo = driver               # para cerrarlo al final aunque el flujo falle
     if navegar:
         driver.get(url)
         WebDriverWait(driver, TIMEOUT_WEB).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -514,6 +528,16 @@ OPCIONES_BUSQUEDA = ("Teléfono", "Telefono", "Cuenta", "Customer Id", "ICCID", 
 
 def _buscar_toggle(driver):
     """El botón del desplegable de tipo de búsqueda (no el menú del usuario)."""
+    # 0) Un botón/desplegable cuyo texto ES un tipo de búsqueda (en la ficha del cliente
+    #    hay muchos textos con "Cuenta"; así no confunde una etiqueta con el botón)
+    opciones = {_normaliza(o) for o in OPCIONES_BUSQUEDA}
+    for el in driver.find_elements(By.XPATH, "//button | //*[contains(@class,'dropdown-toggle')]"
+                                             " | //*[@data-toggle='dropdown']"):
+        try:
+            if el.is_displayed() and _normaliza(" ".join(el.text.split())) in opciones:
+                return el
+        except Exception:
+            continue
     # 1) Por su texto actual: es el único que muestra un tipo de búsqueda
     for opcion in OPCIONES_BUSQUEDA:
         xp = _xpath_texto(("button", "a", "span", "div"), opcion)
@@ -575,7 +599,8 @@ def seleccionar_tipo_busqueda(driver, texto=TIPO_BUSQUEDA):
     except Exception:
         driver.execute_script("arguments[0].click();", opcion)
     time.sleep(1)
-    nuevo = _buscar_toggle(driver).text.strip()
+    toggle = _buscar_toggle(driver)
+    nuevo = toggle.text.strip() if toggle is not None else ""
     if _normaliza(texto) in _normaliza(nuevo):
         log.info("[8/8] LISTO: el tipo de búsqueda cambió de %r a %r", actual, nuevo)
     else:
@@ -716,6 +741,9 @@ def esperar_popup(driver, handles_antes, timeout=TIMEOUT_POPUP):
             try:
                 driver.switch_to.window(h)
                 nuevo = h
+                if _texto_alerta(driver):             # la ventana nueva es una alerta: no espero más
+                    log.info("[8/8] Ventana nueva con alerta: %s", driver.current_url)
+                    return h
                 if REGEX_POPUP.search(driver.current_url) or REGEX_POPUP.search(driver.title or ""):
                     log.info("[8/8] Popup detectado: %s", driver.current_url)
                     return h
@@ -729,34 +757,423 @@ def esperar_popup(driver, handles_antes, timeout=TIMEOUT_POPUP):
     return None
 
 
+def _filas_con_datos(tabla):
+    return [f for f in tabla.find_elements(By.XPATH, ".//tbody/tr") if f.find_elements(By.TAG_NAME, "td")]
+
+
+def _tablas_servicios(driver):
+    """Tablas de servicios del popup: [(encabezados, filas), ...].
+
+    La tabla tiene scroll propio: a veces el encabezado y el cuerpo son dos <table>
+    distintas (encabezado fijo arriba). En ese caso las filas salen de la tabla siguiente.
+    """
+    tablas = []
+    for tabla in driver.find_elements(By.TAG_NAME, "table"):
+        try:
+            cabecera = [" ".join(th.text.split()) for th in tabla.find_elements(By.TAG_NAME, "th")]
+            if not any("total activas" in _normaliza(h) for h in cabecera):
+                continue
+            filas = _filas_con_datos(tabla)
+            if not filas:
+                siguiente = tabla.find_elements(By.XPATH, "following::table[1]")
+                # solo si es el cuerpo (sin encabezados visibles), no la tabla de otra sección
+                if siguiente and not any(th.text.strip() for th in siguiente[0].find_elements(By.TAG_NAME, "th")):
+                    filas = _filas_con_datos(siguiente[0])
+            tablas.append((cabecera, filas))
+        except Exception:
+            continue                          # la tabla se repintó mientras la leía
+    return tablas
+
+
+def _indice_activas(cabecera):
+    return next((j for j, h in enumerate(cabecera)
+                 if "total activas" in _normaliza(h) and "no activas" not in _normaliza(h)), None)
+
+
+def _indice_no_activas(cabecera):
+    return next((j for j, h in enumerate(cabecera) if "total no activas" in _normaliza(h)), None)
+
+
+def _campo_celda(celda):
+    """El <input> con el número (es lo que se clica) o la celda misma."""
+    campos = celda.find_elements(By.TAG_NAME, "input")
+    return campos[0] if campos else celda
+
+
+# Busca el recuadro que está DEBAJO del encabezado (por posición en pantalla, no por índice de
+# columna: así no se desfasa si la tabla tiene columnas ocultas o encabezado separado).
+_JS_CAMPO_BAJO_ENCABEZADO = r"""
+const [buscado, excluir] = arguments;
+const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase()
+                           .normalize('NFD').replace(/[̀-ͯ]/g, '');
+const ths = [...document.querySelectorAll('th')].filter(th => {
+  const t = norm(th.innerText);
+  return th.offsetParent && t.includes(buscado) && !(excluir && t.includes(excluir));
+});
+for (const th of ths) {
+  // sube desde el encabezado hasta el bloque que ya contiene filas con datos
+  let bloque = th, filas = [];
+  while (bloque && !filas.length) {
+    bloque = bloque.parentElement;
+    if (!bloque) break;
+    filas = [...bloque.querySelectorAll('tbody tr')].filter(tr => tr.querySelector('td'));
+  }
+  if (!filas.length) continue;
+  const r = th.getBoundingClientRect(), cx = r.left + r.width / 2;
+  const debajo = el => { const q = el.getBoundingClientRect();
+                         return q.width > 0 && cx >= q.left && cx <= q.right; };
+  const fila = filas[0];
+  const campo = [...fila.querySelectorAll('input')].find(debajo)
+             || [...fila.querySelectorAll('td')].find(debajo);
+  if (campo) return campo;
+}
+return null;
+"""
+
+
+def _campo_primera_fila(driver, clave):
+    """Vuelve a ubicar el recuadro "activas" o "no_activas" de la 1ra fila (sin referencias viejas).
+    Devuelve el elemento si está visible y habilitado, o None."""
+    buscado, excluir = ("total activas", "no activas") if clave == "activas" else ("total no activas", "")
+    try:
+        campo = driver.execute_script(_JS_CAMPO_BAJO_ENCABEZADO, buscado, excluir)
+        if campo is not None and campo.is_displayed() and campo.is_enabled():
+            return campo
+    except Exception:
+        pass                                  # respaldo: por índice de columna
+    for cabecera, filas in _tablas_servicios(driver):
+        i = _indice_activas(cabecera) if clave == "activas" else _indice_no_activas(cabecera)
+        if i is None or not filas:
+            continue
+        try:
+            celdas = filas[0].find_elements(By.TAG_NAME, "td")
+            if len(celdas) <= i:
+                continue
+            campo = _campo_celda(celdas[i])
+            if campo.is_displayed() and campo.is_enabled():
+                return campo
+        except Exception:
+            continue                          # se repintó mientras lo buscaba
+    return None
+
+
+def esperar_boton_total(driver, clave, timeout=TIMEOUT_BOTON_TOTAL):
+    """Espera hasta que el recuadro de la 1ra fila esté listo para clicarlo."""
+    fin = time.time() + timeout
+    while time.time() < fin:
+        campo = _campo_primera_fila(driver, clave)
+        if campo is not None:
+            return campo
+        time.sleep(0.5)
+    return None
+
+
+# Qué eventos tiene el recuadro (para el log): HTML propio, de la celda y handlers de jQuery
+_JS_DESCRIBIR = r"""
+const el = arguments[0], td = el.closest('td'), tr = el.closest('tr');
+const ev = x => { try { const d = window.jQuery && jQuery._data(x, 'events');
+                        return d ? Object.keys(d).join(',') : ''; } catch (e) { return ''; } };
+return {
+  html: el.outerHTML.slice(0, 400),
+  td: td ? td.outerHTML.slice(0, 400) : '',
+  eventos_input: ev(el), eventos_td: td ? ev(td) : '', eventos_tr: tr ? ev(tr) : '',
+};
+"""
+
+# Dispara la secuencia completa de eventos de mouse sobre el elemento (algunos sitios solo
+# escuchan mousedown/mouseup o dblclick, no click)
+_JS_EVENTOS_MOUSE = r"""
+const el = arguments[0];
+for (const tipo of ['mouseover', 'mousedown', 'focus', 'mouseup', 'click', 'dblclick']) {
+  const e = tipo === 'focus' ? new FocusEvent('focus')
+          : new MouseEvent(tipo, {bubbles: true, cancelable: true, view: window, detail: tipo === 'dblclick' ? 2 : 1});
+  el.dispatchEvent(e);
+}
+"""
+
+
+def _aparecio_detalle(driver, handles_antes, handle_popup):
+    """Detecta el popup de líneas: una ventana nueva, o el mismo popup mostrando "Líneas asociadas"
+    (a veces SIAC lo abre dentro de la misma ventana). Devuelve el handle o None."""
+    nuevas = set(driver.window_handles) - set(handles_antes)
+    if nuevas:
+        return nuevas.pop()
+    try:
+        driver.switch_to.window(handle_popup)
+        texto = driver.execute_script(_JS_TEXTO_VISIBLE) or ""
+        if REGEX_DETALLE.search(texto):
+            return handle_popup
+    except Exception:
+        pass
+    return None
+
+
+def clic_total_y_esperar_popup(driver, clave, handles_antes):
+    """Clic en el recuadro de la 1ra fila probando varias formas de clic.
+
+    Después de cada intento espera ESPERA_POPUP_DETALLE s a que aparezca el detalle;
+    solo prueba la siguiente forma si no apareció (así no abre dos popups).
+    Devuelve el handle donde quedó el detalle, o None."""
+    handle_popup = driver.current_window_handle
+
+    campo = esperar_boton_total(driver, clave)
+    if campo is None:
+        log.warning("[8/8] No encontré el recuadro de la primera fila para clicarlo.")
+        return None
+    try:
+        # marco en rojo el recuadro que voy a clicar, para verlo en pantalla
+        driver.execute_script("arguments[0].style.outline='3px solid red';", campo)
+        log.info("[8/8] Recuadro a clicar: columna %r, valor %r",
+                 "Total Activas" if clave == "activas" else "Total No Activas",
+                 (campo.get_attribute("value") or campo.text or "").strip())
+        info = driver.execute_script(_JS_DESCRIBIR, campo)
+        log.info("[8/8] Recuadro: %s", info["html"])
+        log.info("[8/8] Celda:    %s", info["td"])
+        log.info("[8/8] Eventos jQuery -> input: %r | td: %r | tr: %r",
+                 info["eventos_input"], info["eventos_td"], info["eventos_tr"])
+    except Exception:
+        pass
+
+    def celda(el):
+        return el.find_element(By.XPATH, "./ancestor-or-self::td[1]")
+
+    intentos = (
+        ("clic normal", lambda el: el.click()),
+        ("clic con el mouse", lambda el: ActionChains(driver).move_to_element(el).pause(0.3).click().perform()),
+        ("foco + ENTER", lambda el: (el.click(), el.send_keys(Keys.ENTER))),
+        ("eventos de mouse completos", lambda el: driver.execute_script(_JS_EVENTOS_MOUSE, el)),
+        ("clic por JavaScript", lambda el: driver.execute_script("arguments[0].click();", el)),
+        ("clic en la celda", lambda el: ActionChains(driver).move_to_element(celda(el)).pause(0.3).click().perform()),
+        ("doble clic", lambda el: ActionChains(driver).double_click(el).perform()),
+    )
+    for nombre, clic in intentos:
+        driver.switch_to.window(handle_popup)
+        campo = esperar_boton_total(driver, clave)
+        if campo is None:
+            log.warning("[8/8] El recuadro de la primera fila desapareció.")
+            return _aparecio_detalle(driver, handles_antes, handle_popup)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", campo)
+        time.sleep(0.5)
+        try:
+            clic(campo)
+        except Exception as e:
+            log.info("[8/8] %s falló (%s); pruebo otra forma.", nombre, type(e).__name__)
+            continue
+        log.info("[8/8] %s hecho; espero el popup (hasta %s s)...", nombre.capitalize(), ESPERA_POPUP_DETALLE)
+        fin = time.time() + ESPERA_POPUP_DETALLE
+        while time.time() < fin:
+            texto = _alerta_nativa(driver)
+            if texto is not None:
+                log.warning("[8/8] Salió una alerta al clicar: %r", texto)
+            destino = _aparecio_detalle(driver, handles_antes, handle_popup)
+            if destino:
+                donde = "misma ventana" if destino == handle_popup else "ventana nueva"
+                log.info("[8/8] Detalle abierto (%s) con %s.", donde, nombre)
+                return destino
+            time.sleep(0.5)
+        log.info("[8/8] Con %s no se abrió el popup; pruebo otra forma.", nombre)
+    return None
+
+
+def esperar_primera_fila(driver, timeout=TIMEOUT_DATOS):
+    """Espera a que la 1ra fila de productos tenga Producto y Total Activas y la imprime.
+
+    Devuelve {"activas": (elemento, valor), "no_activas": (elemento, valor)};
+    None si no cargó a tiempo. "no_activas" es (None, 0) si la tabla no tiene esa columna."""
+    log.info("[8/8] Esperando la primera fila de productos (hasta %s s)...", timeout)
+    fin = time.time() + timeout
+    while time.time() < fin:
+        for cabecera, filas in _tablas_servicios(driver):
+            i_act = _indice_activas(cabecera)
+            if i_act is None or not filas:
+                continue
+            try:
+                celdas = filas[0].find_elements(By.TAG_NAME, "td")
+                if len(celdas) <= i_act:
+                    continue
+                valores = [_valor_celda(c) for c in celdas]
+            except Exception:
+                continue                      # se repintó; reintento
+            if not (valores[0] and valores[i_act]):
+                continue                      # todavía sin datos
+
+            print("\nPrimera fila de productos:")
+            for j, v in enumerate(valores):
+                nombre = cabecera[j] if j < len(cabecera) and cabecera[j] else f"col {j}"
+                print(f"  {nombre:<20} {v}")
+            print()
+
+            i_no = _indice_no_activas(cabecera)
+            no_activas = (None, 0)
+            if i_no is not None and i_no < len(celdas):
+                no_activas = (_campo_celda(celdas[i_no]), _a_entero(valores[i_no]) or 0)
+            return {"activas": (_campo_celda(celdas[i_act]), _a_entero(valores[i_act]) or 0),
+                    "no_activas": no_activas}
+        time.sleep(1)
+
+    log.warning("[8/8] No detecté la primera fila en %s s.", timeout)
+    return None
+
+
 def _leer_tablas(driver):
     """Una pasada sobre las tablas del popup: [(clave_cuenta, activas, no_activas), ...]."""
     filas_datos = []
-    for i, tabla in enumerate(driver.find_elements(By.TAG_NAME, "table")):
-        try:
-            cabecera = [_normaliza(" ".join(th.text.split()))
-                        for th in tabla.find_elements(By.TAG_NAME, "th")]
-        except Exception:
-            continue
-
-        i_act = next((j for j, h in enumerate(cabecera) if "total activas" in h), None)
+    for i, (cabecera, filas) in enumerate(_tablas_servicios(driver)):
+        cabecera = [_normaliza(h) for h in cabecera]
+        i_act = _indice_activas(cabecera)
         i_no = next((j for j, h in enumerate(cabecera) if "total no activas" in h), None)
         if i_act is None or i_no is None:
             continue                       # no es una tabla de servicios
         i_cta = next((j for j, h in enumerate(cabecera) if "cuenta" in h), None)
 
-        for fila in tabla.find_elements(By.XPATH, ".//tbody/tr"):
-            celdas = fila.find_elements(By.TAG_NAME, "td")
-            if len(celdas) <= max(i_act, i_no):
-                continue
-            act = _a_entero(_valor_celda(celdas[i_act]))
-            no = _a_entero(_valor_celda(celdas[i_no]))
+        for fila in filas:
+            try:
+                celdas = fila.find_elements(By.TAG_NAME, "td")
+                if len(celdas) <= max(i_act, i_no):
+                    continue
+                act = _a_entero(_valor_celda(celdas[i_act]))
+                no = _a_entero(_valor_celda(celdas[i_no]))
+            except Exception:
+                continue                   # fila repintada a mitad de la lectura
             if act is None and no is None:
                 continue
             cuenta = _valor_celda(celdas[i_cta]) if i_cta is not None else str(len(filas_datos))
             filas_datos.append((f"{i}|{cuenta}", act or 0, no or 0))
 
     return filas_datos
+
+
+# Texto visible de la página y de sus iframes (la alerta puede venir dentro de uno)
+_JS_TEXTO_VISIBLE = r"""
+let t = document.body ? document.body.innerText : '';
+for (const f of document.querySelectorAll('iframe')) {
+  try { t += '\n' + f.contentDocument.body.innerText; } catch (e) {}
+}
+return t;
+"""
+
+
+def _texto_alerta(driver):
+    """El mensaje de la alerta si la ventana ACTUAL muestra una, o "" si no."""
+    try:
+        texto = driver.execute_script(_JS_TEXTO_VISIBLE) or ""
+    except Exception:
+        return ""
+    if not REGEX_ALERTA.search(texto):
+        return ""
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+    return next((l for l in lineas if REGEX_ALERTA.search(l) and _normaliza(l) != "alerta"), "Alerta")
+
+
+def _alerta_nativa(driver):
+    """Si hay un alert() de JavaScript abierto, lo acepta y devuelve su texto; si no, None."""
+    try:
+        alerta = driver.switch_to.alert
+        texto = alerta.text or "Alerta"
+        alerta.accept()
+        return texto
+    except Exception:
+        return None
+
+
+def buscar_ventana_alerta(driver, excluir=()):
+    """Recorre las ventanas abiertas (menos las excluidas) buscando la alerta.
+    Devuelve (handle, mensaje) y deja el driver en esa ventana, o (None, "")."""
+    for h in driver.window_handles:
+        if h in excluir:
+            continue
+        try:
+            driver.switch_to.window(h)
+        except Exception:
+            continue                          # se cerró mientras recorría
+        mensaje = _texto_alerta(driver)
+        if mensaje:
+            return h, mensaje
+    return None, ""
+
+
+def esperar_contenido_popup(driver, popup, handle_siac, timeout=TIMEOUT_DATOS):
+    """Espera a que aparezcan las tablas del popup o una alerta (en cualquier ventana nueva).
+
+    Devuelve ("datos", "", popup) | ("alerta", mensaje, handle_alerta) | ("nativa", mensaje, None)
+    | (None, "", popup) si se agotó el tiempo.
+    """
+    fin = time.time() + timeout
+    while time.time() < fin:
+        texto = _alerta_nativa(driver)
+        if texto is not None:
+            return "nativa", texto, None
+
+        h, mensaje = buscar_ventana_alerta(driver, excluir=(handle_siac,))
+        if h:
+            return "alerta", mensaje, h
+
+        if popup in driver.window_handles:
+            try:
+                driver.switch_to.window(popup)
+                if _leer_tablas(driver):
+                    return "datos", "", popup
+            except Exception:
+                pass
+        time.sleep(1)
+    return None, "", popup
+
+
+_XPATH_ACEPTAR = (_xpath_texto(("button", "a", "span", "div"), "aceptar") +
+                  " | //input[contains(translate(@value,'ACEPTR','aceptr'),'aceptar')]")
+
+
+def aceptar_alerta(driver, handle_alerta, timeout=10):
+    """En la ventana de la alerta: busca el botón Aceptar (también en iframes) y le hace clic.
+    Si no lo encuentra o la ventana no se cierra, la cierra directamente."""
+    driver.switch_to.window(handle_alerta)
+    log.info("[8/8] Alerta: controlando la ventana %r | %s", driver.title, driver.current_url)
+
+    boton = _buscar_en_frames(driver, _XPATH_ACEPTAR, timeout=timeout)
+    if boton is None:
+        visibles = [e.text.strip() for e in driver.find_elements(By.XPATH, "//button | //a | //input")
+                    if e.is_displayed() and e.text.strip()][:15]
+        log.warning("[8/8] Alerta: no encontré 'Aceptar'. Botones visibles: %s", ", ".join(visibles) or "ninguno")
+    else:
+        # el xpath puede devolver el span de adentro: subo al botón/enlace si lo hay
+        padre = boton.find_elements(By.XPATH, "./ancestor-or-self::*[self::button or self::a][1]")
+        boton = padre[0] if padre else boton
+        log.info("[8/8] Alerta: botón encontrado (%s %r); clic...", boton.tag_name, boton.text.strip())
+        try:
+            boton.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", boton)
+        log.info("[8/8] Alerta: clic en Aceptar. Esperando que se cierre (hasta %s s)...",
+                 TIMEOUT_CIERRE_ALERTA)
+        if _esperar_cierre_alerta(driver, handle_alerta, TIMEOUT_CIERRE_ALERTA):
+            log.info("[8/8] Alerta: cerrada.")
+            return
+
+    # no se cerró sola (o no hubo botón): la cierro yo y confirmo que desapareció
+    try:
+        driver.switch_to.window(handle_alerta)
+        driver.close()
+        log.info("[8/8] Alerta: no se cerró sola; la cerré desde el navegador.")
+    except Exception:
+        pass
+    if not _esperar_cierre_alerta(driver, handle_alerta, 5):
+        log.warning("[8/8] Alerta: la ventana sigue abierta; continúo igual.")
+
+
+def _esperar_cierre_alerta(driver, handle_alerta, timeout):
+    """True cuando la ventana de la alerta desaparece (o deja de mostrar la alerta)."""
+    fin = time.time() + timeout
+    while time.time() < fin:
+        if handle_alerta not in driver.window_handles:
+            return True
+        try:
+            driver.switch_to.window(handle_alerta)
+            if not _texto_alerta(driver):         # la misma ventana siguió a otra página
+                return True
+        except Exception:
+            return True                           # se cerró mientras la consultaba
+        time.sleep(0.5)
+    return False
 
 
 def extraer_totales(driver, timeout=TIMEOUT_DATOS):
@@ -785,32 +1202,6 @@ def extraer_totales(driver, timeout=TIMEOUT_DATOS):
     return filas
 
 
-def elementos_activas(driver, solo_positivos=True):
-    """Los campos 'Total Activas' del popup, para hacerles clic: [(elemento, valor), ...]."""
-    objetivos = []
-    for tabla in driver.find_elements(By.TAG_NAME, "table"):
-        try:
-            cabecera = [_normaliza(" ".join(th.text.split()))
-                        for th in tabla.find_elements(By.TAG_NAME, "th")]
-        except Exception:
-            continue
-        i_act = next((j for j, h in enumerate(cabecera)
-                      if "total activas" in h and "no activas" not in h), None)
-        if i_act is None:
-            continue
-        for fila in tabla.find_elements(By.XPATH, ".//tbody/tr"):
-            celdas = fila.find_elements(By.TAG_NAME, "td")
-            if len(celdas) <= i_act:
-                continue
-            celda = celdas[i_act]
-            valor = _a_entero(_valor_celda(celda)) or 0
-            if solo_positivos and valor <= 0:
-                continue                      # un 0 no tiene detalle que mostrar
-            campos = celda.find_elements(By.TAG_NAME, "input")
-            objetivos.append((campos[0] if campos else celda, valor))
-    return objetivos
-
-
 def inspeccionar_popup(driver, max_filas=3):
     """Registra en el log qué trae el popup: título, columnas y primeras filas."""
     log.info("[8/8] Detalle -> %r | %s", driver.title, driver.current_url)
@@ -829,26 +1220,89 @@ def inspeccionar_popup(driver, max_filas=3):
                 log.info("[8/8]     %s", " | ".join(celdas))
 
 
-def abrir_detalle_activas(driver, handle_popup):
-    """Clic en el número de Total Activas; devuelve el handle del segundo popup."""
-    objetivos = elementos_activas(driver)
-    if not objetivos:
-        log.info("[8/8] Ninguna fila con activas > 0; no hay detalle que abrir.")
-        return None
+def _contenedor_detalle(driver):
+    """Si el detalle se abrió como ventana modal dentro de la página, esa modal; si no, la página.
+    Así no se clica un número de la tabla de productos que queda debajo."""
+    for modal in reversed(driver.find_elements(
+            By.CSS_SELECTOR, ".modal.in, .modal.show, .modal[style*='display: block'], [role='dialog']")):
+        try:
+            if modal.is_displayed() and REGEX_DETALLE.search(modal.text or ""):
+                return modal
+        except Exception:
+            continue
+    return driver
 
-    elemento, valor = objetivos[0]
-    handles_antes = driver.window_handles
-    log.info("[8/8] Clic en Total Activas = %d (de %d filas con activas)...", valor, len(objetivos))
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elemento)
+
+def _primer_numero(driver):
+    """El primer número clicable de la ventana de detalle (enlace, botón o celda), o None."""
+    xp = (".//tbody//tr//a | .//tbody//tr//button | .//tbody//tr//input"
+          " | .//tbody//tr//span | .//tbody//tr//td")
+    base = _contenedor_detalle(driver)
+    if base is driver:
+        xp = xp.replace(".//", "//")
+    for el in base.find_elements(By.XPATH, xp):
+        try:
+            texto = (el.text or el.get_attribute("value") or "").strip()
+            if re.fullmatch(r"\d[\d\s.\-]*", texto) and el.is_displayed():
+                return el, texto
+        except Exception:
+            continue                          # se repintó mientras lo leía
+    return None, ""
+
+
+def clic_primer_numero(driver, handle_siac, timeout=TIMEOUT_DATOS):
+    """En la ventana de detalle: clic en el primer número, que redirige a SIAC; espera ahí."""
+    log.info("[8/8] Detalle: esperando el primer número (hasta %s s)...", timeout)
+    fin = time.time() + timeout
+    el, texto = None, ""
+    while time.time() < fin and el is None:
+        el, texto = _primer_numero(driver)
+        if el is None:
+            time.sleep(1)
+    if el is None:
+        log.warning("[8/8] Detalle: no encontré ningún número que clicar.")
+        return False
+
+    log.info("[8/8] Detalle: clic en el primer número -> %s", texto)
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     time.sleep(0.5)
     try:
-        elemento.click()
+        el.click()
     except Exception:
-        driver.execute_script("arguments[0].click();", elemento)
+        driver.execute_script("arguments[0].click();", el)
 
-    detalle = esperar_popup(driver, handles_antes)
+    driver.switch_to.window(handle_siac)
+    log.info("[8/8] De vuelta en SIAC; espero %s s...", ESPERA_TRAS_NUMERO)
+    time.sleep(ESPERA_TRAS_NUMERO)
+    _esperar_carga(driver)
+    log.info("[8/8] SIAC: %s", driver.current_url)
+    return True
+
+
+def abrir_detalle_activas(driver, handle_popup):
+    """Clic en el Total Activas de la 1ra fila; si es 0, en su Total No Activas.
+    Devuelve el handle del popup de líneas que se abre, o None."""
+    driver.switch_to.window(handle_popup)
+    fila = esperar_primera_fila(driver)
+    if fila is None:
+        return None
+
+    clave, columna = "activas", "Total Activas"
+    elemento, valor = fila["activas"]
+    if valor <= 0:
+        clave, columna = "no_activas", "Total No Activas"
+        elemento, valor = fila["no_activas"]
+        if elemento is None or valor <= 0:
+            log.info("[8/8] La primera fila tiene 0 activas y 0 no activas; no hay detalle que abrir.")
+            return None
+        log.info("[8/8] Activas = 0; uso Total No Activas = %d.", valor)
+
+    handles_antes = driver.window_handles
+    log.info("[8/8] Esperando el recuadro %s = %d de la primera fila (hasta %s s)...",
+             columna, valor, TIMEOUT_BOTON_TOTAL)
+    detalle = clic_total_y_esperar_popup(driver, clave, handles_antes)
     if detalle is None:
-        log.warning("[8/8] El clic no abrió un segundo popup.")
+        log.warning("[8/8] Ninguna forma de clic en %s abrió el popup.", columna)
         try:
             driver.switch_to.window(handle_popup)
         except Exception:
@@ -862,21 +1316,17 @@ def abrir_detalle_activas(driver, handle_popup):
     return detalle
 
 
-def sumar_totales(filas):
-    """Suma activas y no activas; agrupa por cuenta para no contar dos veces el mismo total."""
-    if AGRUPAR_POR_CUENTA:
-        por_cuenta = {}
-        for clave, act, no in filas:
-            por_cuenta[clave] = (act, no)
-        pares = list(por_cuenta.values())
-    else:
-        pares = [(act, no) for _, act, no in filas]
-    return sum(a for a, _ in pares), sum(n for _, n in pares)
-
-
 def cerrar_popup(driver, handle_popup, handle_siac):
     """Clic en Cerrar; si no aparece el botón, cierra la ventana directamente."""
+    if handle_popup not in driver.window_handles:  # ya se cerró sola
+        try:
+            driver.switch_to.window(handle_siac)
+        except Exception:
+            pass
+        return
     try:
+        # el botón Cerrar se busca SOLO en el popup (en SIAC podría ser "Cerrar sesión")
+        driver.switch_to.window(handle_popup)
         xp = (_xpath_texto(("button", "a", "span"), "cerrar") +
               " | //input[contains(translate(@value,'CERRAR','cerrar'),'cerrar')]")
         botones = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
@@ -906,14 +1356,76 @@ def cerrar_popup(driver, handle_popup, handle_siac):
             driver.switch_to.window(vivas[-1][0])
 
 
-def guardar_fila_csv(ruc, activas, no_activas, ruta=ARCHIVO_CSV):
+# Lee el panel "Datos del Cliente": busca la etiqueta (texto exacto, sin tildes ni
+# mayúsculas) y devuelve el texto del elemento de al lado.
+_JS_DATOS_CLIENTE = r"""
+const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase()
+                           .normalize('NFD').replace(/[̀-ͯ]/g, '');
+const els = document.querySelectorAll('td,th,label,dt,dd,div,span,strong,b,p');
+function valor(etiquetas) {
+  for (const et of etiquetas) {
+    for (const el of els) {
+      if (!el.offsetParent || norm(el.innerText) !== et) continue;
+      const sib = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
+      const v = sib ? sib.innerText.replace(/\s+/g, ' ').trim() : '';
+      if (v) return v;
+    }
+  }
+  return '';
+}
+return {
+  cliente:             valor(['cliente', 'razon social', 'nombres y apellidos']),
+  contacto:            valor(['contacto']),
+  representante_legal: valor(['representante legal', 'rep. legal']),
+  telefono:            valor(['tel. referencia 1', 'tel. referencia', 'telefono referencia', 'telefono']),
+  email:               valor(['email', 'e-mail', 'correo', 'correo electronico']),
+};
+"""
+
+# Datos del cliente que se guardan, en el orden de las columnas del CSV
+CAMPOS_CLIENTE = ["cliente", "contacto", "representante_legal", "telefono", "email"]
+
+
+def leer_datos_cliente(driver, timeout=TIMEOUT_DATOS):
+    """En la ficha del cliente de SIAC: un dict con CAMPOS_CLIENTE (vacíos si no están)."""
+    fin = time.time() + timeout
+    datos = {}
+    while time.time() < fin:
+        try:
+            datos = driver.execute_script(_JS_DATOS_CLIENTE) or {}
+        except Exception:
+            pass                              # la página aún se está pintando
+        if datos.get("cliente"):
+            break
+        time.sleep(1)
+    datos = {c: datos.get(c, "") for c in CAMPOS_CLIENTE}
+    datos["cliente"] = re.sub(r"\s*\.\.\.\s*$", "", datos["cliente"])   # quita el botón "..."
+    log.info("[8/8] %s", " | ".join(f"{c}: {datos[c]!r}" for c in CAMPOS_CLIENTE))
+    return datos
+
+
+COLUMNAS_CSV = ["ruc"] + CAMPOS_CLIENTE
+
+
+def guardar_fila_csv(ruc, datos=None, ruta=ARCHIVO_CSV):
+    """Agrega una fila al CSV. datos: dict con CAMPOS_CLIENTE, o un texto (ej. "ERROR") para todas."""
     archivo = Path(ruta)
+    if archivo.exists():
+        with open(archivo, newline="", encoding="utf-8-sig") as f:
+            cabecera = next(csv.reader(f), [])
+        if cabecera != COLUMNAS_CSV:          # CSV del formato anterior: lo aparto, no lo mezclo
+            respaldo = archivo.with_name(f"{archivo.stem}_anterior_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+            archivo.rename(respaldo)
+            log.info("[8/8] El CSV tenía otras columnas; lo moví a %s", respaldo.name)
     nuevo = not archivo.exists()
     with open(archivo, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         if nuevo:
-            w.writerow(["ruc", "nro total activas", "nro total no activas"])
-        w.writerow([ruc, activas, no_activas])
+            w.writerow(COLUMNAS_CSV)
+        if isinstance(datos, str):
+            w.writerow([ruc] + [datos] * len(CAMPOS_CLIENTE))
+        else:
+            w.writerow([ruc] + [(datos or {}).get(c, "") for c in CAMPOS_CLIENTE])
 
 
 def buscar_lote(driver, valores=None):
@@ -930,34 +1442,60 @@ def buscar_lote(driver, valores=None):
 
     for i, valor in enumerate(valores, 1):
         log.info("[8/8] (%d/%d) --- %s ---", i, total, valor)
+        guardado = False
         try:
             handles_antes = driver.window_handles
             buscar_en_siac(driver, valor)
 
+            datos = {}
             popup = esperar_popup(driver, handles_antes)
             if popup is None:
                 log.warning("[8/8] (%d/%d) %s: no apareció el popup en %s s.", i, total, valor, TIMEOUT_POPUP)
-                guardar_fila_csv(valor, "", "")
             else:
                 driver.switch_to.window(popup)
-                filas = extraer_totales(driver)
-                if filas:
-                    activas, no_activas = sumar_totales(filas)
-                    log.info("[8/8] (%d/%d) %s -> activas=%d, no activas=%d (%d filas)",
-                             i, total, valor, activas, no_activas, len(filas))
-                    guardar_fila_csv(valor, activas, no_activas)
-                    if CLIC_EN_TOTAL_ACTIVAS:
-                        detalle = abrir_detalle_activas(driver, popup)
-                        if detalle:
-                            cerrar_popup(driver, detalle, popup)   # cierro el detalle, vuelvo al 1er popup
+                _esperar_carga(driver)
+                contenido, mensaje, h_alerta = esperar_contenido_popup(driver, popup, handle_siac)
+                if contenido == "datos":
+                    driver.switch_to.window(popup)
+                    filas = extraer_totales(driver)
                 else:
+                    filas = []
+
+                if contenido in ("alerta", "nativa"):
+                    log.warning("[8/8] (%d/%d) %s: alerta -> %r. Acepto y guardo vacío.",
+                                i, total, valor, mensaje)
+                    if h_alerta:
+                        aceptar_alerta(driver, h_alerta)
+                    # cierro cualquier otra ventana que haya quedado (ej. Consulta de Productos vacía)
+                    for h in list(driver.window_handles):
+                        if h != handle_siac:
+                            cerrar_popup(driver, h, handle_siac)
+                    driver.switch_to.window(handle_siac)      # la alerta ya cerró: vuelvo a SIAC
+                    _esperar_carga(driver)
+                elif not filas:
                     log.info("[8/8] (%d/%d) %s: el popup vino vacío.", i, total, valor)
-                    guardar_fila_csv(valor, "", "")
+                elif CLIC_EN_TOTAL_ACTIVAS:
+                    detalle = abrir_detalle_activas(driver, popup)
+                    if detalle and clic_primer_numero(driver, handle_siac):   # redirige a SIAC
+                        datos = leer_datos_cliente(driver)
+                        cerrar_popup(driver, detalle, handle_siac)   # cierro el detalle si sigue abierto
                 cerrar_popup(driver, popup, handle_siac)
+
+            guardar_fila_csv(valor, datos)
+            guardado = True
+            log.info("[8/8] (%d/%d) %s guardado en el CSV.", i, total, valor)
+
+            # la ficha del cliente deja el desplegable en "Cuenta": vuelvo a "Documento Identidad"
+            # para el siguiente RUC
+            if i < total:
+                driver.switch_to.window(handle_siac)
+                log.info("[8/8] Preparando el siguiente RUC: desplegable -> %r", TIPO_BUSQUEDA)
+                seleccionar_tipo_busqueda(driver)
 
         except Exception as e:
             log.warning("[8/8] (%d/%d) %s falló: %s. Recargo SIAC y sigo.", i, total, valor, e)
-            guardar_fila_csv(valor, "ERROR", "ERROR")
+            if not guardado:                        # si falló al cambiar el desplegable, ya estaba guardado
+                guardar_fila_csv(valor, "ERROR")
             try:
                 for h in driver.window_handles:      # cierro popups que hayan quedado sueltos
                     if h != handle_siac:
@@ -1265,6 +1803,64 @@ def flujo_portal(url=URL_SELENIUM, opcion=TEXTO_OPCION):
     return driver
 
 
+# --------------------------- cierre ---------------------------
+def desconectar_vpn():
+    """Abre la ventana de Ivanti (si hace falta), clica Desconectar y la cierra."""
+    try:
+        ventana = esperar_ventana_ivanti(timeout=3)
+    except RuntimeError:
+        clic_icono_oculto()
+        ventana = esperar_ventana_ivanti()
+    ventana.set_focus()
+    time.sleep(1)
+
+    botones = _botones(ventana, REGEX_BOTON_DESCONECTAR)
+    if not botones:
+        log.info("[fin] Ivanti: no hay botón Desconectar (la VPN ya estaba abajo).")
+    else:
+        log.info("[fin] Ivanti: clic en Desconectar.")
+        botones[0].click_input()
+        # Algunas versiones piden confirmación
+        fin = time.time() + 5
+        while time.time() < fin:
+            confirmado = False
+            for w in _escritorio().windows():
+                try:
+                    if w.is_visible() and REGEX_VENTANA_LOGIN.search(w.window_text() or ""):
+                        si = _botones(w, REGEX_BOTON_CONFIRMAR)
+                        if si:
+                            si[0].click_input()
+                            confirmado = True
+                            break
+                except Exception:
+                    continue
+            if confirmado:
+                break
+            time.sleep(0.5)
+        log.info("[fin] VPN desconectada.")
+
+    try:
+        ventana.close()               # Ivanti solo se oculta a la bandeja
+    except Exception:
+        pass
+
+
+def cerrar_todo(driver, vpn_por_script):
+    """Cierra el navegador y, si este script conectó la VPN, la desconecta."""
+    if driver is not None and not MANTENER_ABIERTO:
+        try:
+            driver.quit()
+            log.info("[fin] Navegador cerrado.")
+        except Exception as e:
+            log.warning("[fin] No pude cerrar el navegador: %s", e)
+
+    if vpn_por_script and DESCONECTAR_VPN_AL_TERMINAR:
+        try:
+            desconectar_vpn()
+        except Exception as e:
+            log.warning("[fin] No pude desconectar la VPN: %s", e)
+
+
 # ---------------------------- main ----------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -1280,6 +1876,8 @@ if __name__ == "__main__":
                     help="Ver qué contraseña hay guardada y probarla contra el portal")
     args = ap.parse_args()
 
+    vpn_por_script = False
+    codigo_salida = 0
     try:
         if args.verificar_password:
             verificar_password()
@@ -1302,19 +1900,22 @@ if __name__ == "__main__":
             sys.exit(0)
 
         if not args.solo_selenium:
+            vpn_por_script = True
             clic_icono_oculto()
             clic_conectar_ivanti()
             log.info("Esperando %s s antes de abrir Selenium...", ESPERA_ANTES_SELENIUM)
             time.sleep(ESPERA_ANTES_SELENIUM)
 
-        driver = flujo_portal()
+        flujo_portal()
+        log.info("[fin] Proceso terminado; cerrando todo...")
 
-        # ---- Aquí sigue tu lógica dentro de SIAC ----
-
-        if not MANTENER_ABIERTO:
-            input("Presiona Enter para cerrar el navegador...")
-            driver.quit()
-
+    except KeyboardInterrupt:
+        log.warning("[fin] Interrumpido por el usuario; cerrando todo...")
+        codigo_salida = 1
     except Exception as e:
         log.exception("Error: %s", e)
-        sys.exit(1)
+        codigo_salida = 1
+    finally:
+        cerrar_todo(_driver_activo, vpn_por_script)
+    sys.exit(codigo_salida)
+
