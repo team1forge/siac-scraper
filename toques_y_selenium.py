@@ -8,6 +8,7 @@ Uso:
   python toques_y_selenium.py                       # con la VPN ya conectada: portal -> SIAC -> lote
   python toques_y_selenium.py --guardar-password    # 1ra vez: guarda la contraseña de forma segura
   python toques_y_selenium.py --verificar-password  # prueba la contraseña guardada contra el portal
+  python toques_y_selenium.py --metricas            # resumen del CSV: OK / falta de datos / bloqueo / fallo
 """
 import argparse
 import base64
@@ -23,6 +24,7 @@ import keyring
 from pywinauto import Desktop
 from pywinauto.keyboard import send_keys
 from selenium import webdriver
+from selenium.common.exceptions import UnexpectedAlertPresentException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -59,6 +61,7 @@ REGEX_ALERTA = re.compile(r"no est[aá] autorizad|^\s*alerta\s*$", re.I | re.M)
 TIMEOUT_CIERRE_ALERTA = 15    # segundos esperando que la alerta se cierre tras el clic en Aceptar
 TIMEOUT_DATOS = 30            # segundos esperando que el popup termine de pintar sus tablas
 ESPERA_DATOS = 2              # segundos entre lectura y lectura del popup
+ESPERA_POPUP_VACIO = 5        # segundos con las tablas sin filas para dar el popup por vacío
 CLIC_EN_TOTAL_ACTIVAS = True  # tras leer los totales, clic en el número de activas (abre otro popup)
 TIMEOUT_BOTON_TOTAL = 15      # segundos esperando que el recuadro Total Activas / No Activas esté clicable
 ESPERA_POPUP_DETALLE = 10     # segundos esperando el popup de líneas tras cada intento de clic
@@ -80,6 +83,9 @@ NAVEGADOR = "chrome"          # "chrome" o "edge"
 # Perfil dedicado para conservar cookies/sesión (SSO) entre ejecuciones. None = perfil temporal
 PERFIL_DIR = Path(f"./perfil_{NAVEGADOR}").resolve()
 MANTENER_ABIERTO = False      # True = deja el navegador abierto al terminar el script
+# Si el navegador se cierra a mitad del proceso, se abre de nuevo y se retoma desde el CSV
+MAX_REINICIOS_SIN_AVANCE = 3  # reinicios seguidos sin guardar ningún RUC nuevo antes de rendirse
+MAX_CAIDAS_POR_RUC = 2        # si el navegador se cae N veces con el mismo RUC, lo guardo FALLO y sigo
 # ================================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -108,6 +114,23 @@ def guardar_password():
 
 # -------------------------- Selenium --------------------------
 _driver_activo = None                     # el navegador abierto por abrir_selenium()
+
+
+class NavegadorCerrado(RuntimeError):
+    """El navegador (o el driver) se cerró: hay que abrirlo de nuevo y retomar."""
+
+
+def _driver_vivo(driver):
+    """True si el navegador sigue abierto y responde."""
+    if driver is None:
+        return False
+    try:
+        return bool(driver.window_handles)
+    except UnexpectedAlertPresentException:
+        return True                           # hay un alert() abierto, pero el navegador vive
+    except Exception:
+        return False                          # sesión inválida, chromedriver muerto, sin ventanas...
+
 
 def abrir_selenium(url=URL_SELENIUM, navegar=True):
     if NAVEGADOR == "edge":
@@ -351,7 +374,7 @@ def leer_valores(ruta=ARCHIVO_VALORES, columna=COLUMNA_VALORES, hoja=HOJA_VALORE
         v = str(v).strip()
         return v[:-2] if v.endswith(".0") else v    # openpyxl devuelve los números como 20123456789.0
 
-    valores, vistos = [], []
+    valores, vistos = [], set()
     primera = cabecera[idx] if idx < len(cabecera) else ""
     if primera.replace(" ", "").isdigit() and len(primera) >= 8:
         valores.append(limpiar(primera))            # el archivo no tenía encabezados
@@ -361,7 +384,7 @@ def leer_valores(ruta=ARCHIVO_VALORES, columna=COLUMNA_VALORES, hoja=HOJA_VALORE
             continue
         v = limpiar(fila[idx])
         if v and v not in vistos:
-            vistos.append(v)
+            vistos.add(v)
             valores.append(v)
     wb.close()
 
@@ -454,6 +477,18 @@ def _popup_sin_datos(driver):
     except Exception:
         return False                          # se repintó mientras la leía
     return True
+
+
+def _tablas_sin_filas(driver):
+    """True si las tablas de servicios están cargadas pero sin ninguna fila con texto
+    (pasa cuando el documento no tiene productos: solo se ven los encabezados)."""
+    tablas = _tablas_servicios(driver)
+    if not tablas:
+        return False
+    try:
+        return all(not any(f.text.strip() for f in filas) for _, filas in tablas)
+    except Exception:
+        return False                          # se repintó mientras la leía
 
 
 def _indice_activas(cabecera):
@@ -749,12 +784,14 @@ def esperar_contenido_popup(driver, popup, excluir, timeout=TIMEOUT_DATOS):
     """Espera a que aparezcan las tablas del popup o una alerta (en cualquier ventana menos
     las de 'excluir', ej. SIAC y el portal).
 
-    Devuelve ("datos", "", popup) | ("vacio", "", popup) si dice "No existen datos"
+    Devuelve ("datos", "", popup)
+    | ("vacio", "", popup) si dice "No existen datos" o las tablas siguen sin filas ESPERA_POPUP_VACIO s
     | ("clientes", "", popup) si es la lista "Consulta de Clientes"
     | ("alerta", mensaje, handle_alerta) | ("nativa", mensaje, None)
     | (None, "", popup) si se agotó el tiempo.
     """
     fin = time.time() + timeout
+    vacio_desde = None                        # desde cuándo las tablas se ven sin filas
     while time.time() < fin:
         texto = _alerta_nativa(driver)
         if texto is not None:
@@ -773,6 +810,13 @@ def esperar_contenido_popup(driver, popup, excluir, timeout=TIMEOUT_DATOS):
                     return "vacio", "", popup
                 if REGEX_CONSULTA_CLIENTES.search(driver.execute_script(_JS_TEXTO_VISIBLE) or ""):
                     return "clientes", "", popup
+                if _tablas_sin_filas(driver):
+                    # puede estar cargando: solo lo doy por vacío si sigue así unos segundos
+                    vacio_desde = vacio_desde or time.time()
+                    if time.time() - vacio_desde >= ESPERA_POPUP_VACIO:
+                        return "vacio", "", popup
+                else:
+                    vacio_desde = None
             except Exception:
                 pass
         time.sleep(1)
@@ -1147,16 +1191,61 @@ def leer_datos_cliente(driver, timeout=TIMEOUT_DATOS):
     return datos
 
 
-COLUMNAS_CSV = ["ruc"] + CAMPOS_CLIENTE
+# Estado de cada RUC en el CSV (columna "estado"); "detalle" dice el motivo concreto
+OK = "OK"                  # se leyó la ficha del cliente
+SIN_DATOS = "SIN_DATOS"    # SIAC no tiene datos: "No existen datos", sin opción RUC, 0 líneas...
+BLOQUEO = "BLOQUEO"        # alerta "No está autorizado"
+FALLO = "FALLO"            # problema del robot: no abrió el popup/detalle, tiempo agotado, excepción
+ESTADOS = [OK, SIN_DATOS, BLOQUEO, FALLO]
+
+# Columna "estado_ruc": la versión simple del estado
+VALIDO, VACIO, BLOQUEADO = "VALIDO", "VACIO", "BLOQUEADO"
+ESTADO_RUC = {OK: VALIDO, SIN_DATOS: VACIO, FALLO: VACIO, BLOQUEO: BLOQUEADO}
+
+COLUMNAS_CSV = ["ruc", "estado_ruc"] + CAMPOS_CLIENTE + ["estado", "detalle"]
 
 
-def guardar_fila_csv(ruc, datos=None, ruta=ARCHIVO_CSV):
-    """Agrega una fila al CSV. datos: dict con CAMPOS_CLIENTE, o un texto (ej. "ERROR") para todas."""
+def _leer_fila(cabecera, fila):
+    """(ruc, campos, estado, detalle) de una fila, en cualquier formato del CSV (lee por nombre
+    de columna). Si la fila es de un formato sin estado, lo deduce: OK si tiene cliente,
+    FALLO si dice ERROR, SIN_DATOS si está vacía."""
+    d = dict(zip(cabecera, fila))
+    campos = {c: d.get(c, "") for c in CAMPOS_CLIENTE}
+    estado, detalle = d.get("estado", ""), d.get("detalle", "")
+    if not estado:
+        if campos["cliente"] == "ERROR":
+            campos = {c: "" for c in CAMPOS_CLIENTE}
+            estado, detalle = FALLO, "ERROR (formato anterior)"
+        elif campos["cliente"]:
+            estado = OK
+        else:
+            estado, detalle = SIN_DATOS, "vacío, motivo no registrado (formato anterior)"
+    return d.get("ruc", "").strip(), campos, estado, detalle
+
+
+def _fila_csv(ruc, campos, estado, detalle):
+    return ([ruc, ESTADO_RUC.get(estado, VACIO)] + [campos.get(c, "") for c in CAMPOS_CLIENTE]
+            + [estado, detalle])
+
+
+def guardar_fila_csv(ruc, datos=None, estado=OK, detalle="", ruta=ARCHIVO_CSV):
+    """Agrega una fila al CSV: ruc + estado_ruc + CAMPOS_CLIENTE (de 'datos') + estado + detalle."""
     archivo = Path(ruta)
     if archivo.exists():
         with open(archivo, newline="", encoding="utf-8-sig") as f:
-            cabecera = next(csv.reader(f), [])
-        if cabecera != COLUMNAS_CSV:          # CSV del formato anterior: lo aparto, no lo mezclo
+            filas = list(csv.reader(f))
+        cabecera = filas[0] if filas else []
+        if cabecera != COLUMNAS_CSV and "ruc" in cabecera and set(CAMPOS_CLIENTE) <= set(cabecera):
+            # formato anterior: lo paso al nuevo sin perder el avance (ultimo_ruc_csv sigue funcionando)
+            with open(archivo, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(COLUMNAS_CSV)
+                for fila in filas[1:]:
+                    r, campos, est, det = _leer_fila(cabecera, fila)
+                    if r:
+                        w.writerow(_fila_csv(r, campos, est, det))
+            log.info("[8/8] Pasé el CSV existente al formato nuevo (%s).", ", ".join(COLUMNAS_CSV))
+        elif cabecera != COLUMNAS_CSV:        # CSV de otro formato: lo aparto, no lo mezclo
             respaldo = archivo.with_name(f"{archivo.stem}_anterior_{time.strftime('%Y%m%d_%H%M%S')}.csv")
             archivo.rename(respaldo)
             log.info("[8/8] El CSV tenía otras columnas; lo moví a %s", respaldo.name)
@@ -1165,15 +1254,108 @@ def guardar_fila_csv(ruc, datos=None, ruta=ARCHIVO_CSV):
         w = csv.writer(f)
         if nuevo:
             w.writerow(COLUMNAS_CSV)
-        if isinstance(datos, str):
-            w.writerow([ruc] + [datos] * len(CAMPOS_CLIENTE))
-        else:
-            w.writerow([ruc] + [(datos or {}).get(c, "") for c in CAMPOS_CLIENTE])
+        w.writerow(_fila_csv(ruc, datos or {}, estado, detalle))
+
+
+def metricas_csv(ruta=ARCHIVO_CSV, max_listado=20):
+    """Resumen del CSV: cuántos salieron válidos, vacíos (por falta de datos o fallo del robot)
+    y bloqueados. Si un RUC se repite, cuenta su última fila."""
+    archivo = Path(ruta)
+    if not archivo.exists():
+        log.info("[métricas] No existe %s todavía.", archivo.resolve())
+        return {}
+    with open(archivo, newline="", encoding="utf-8-sig") as f:
+        filas = list(csv.reader(f))
+    if not filas:
+        return {}
+    cabecera, filas = filas[0], filas[1:]
+
+    ultimas = {}                              # ruc -> (campos, estado, detalle)
+    for fila in filas:
+        ruc, campos, est, det = _leer_fila(cabecera, fila)
+        if ruc:
+            ultimas[ruc] = (campos, est, det)
+
+    total = len(ultimas)
+    por_estado = {e: [] for e in ESTADOS}
+    for ruc, (_, est, det) in ultimas.items():
+        por_estado.setdefault(est, []).append((ruc, det))
+    n = {e: len(v) for e, v in por_estado.items()}
+    pct = lambda k: f"{100 * k / total:5.1f}%" if total else "  -  "
+    vacios = sum(v for e, v in n.items() if ESTADO_RUC.get(e, VACIO) == VACIO)
+
+    log.info("[métricas] ===== Resumen de %s =====", archivo.name)
+    log.info("[métricas] RUCs procesados: %d (filas en el CSV: %d)", total, len(filas))
+    log.info("[métricas]   %-9s ............ %5d  %s", VALIDO, n[OK], pct(n[OK]))
+    log.info("[métricas]   %-9s ............ %5d  %s", VACIO, vacios, pct(vacios))
+    log.info("[métricas]     - falta de datos .... %5d  %s", n[SIN_DATOS], pct(n[SIN_DATOS]))
+    log.info("[métricas]     - fallo del robot ... %5d  %s", n[FALLO], pct(n[FALLO]))
+    for e in (e for e in n if e not in ESTADOS and n[e]):
+        log.info("[métricas]     - %s ... %5d  %s", e, n[e], pct(n[e]))
+    log.info("[métricas]   %-9s ............ %5d  %s", BLOQUEADO, n[BLOQUEO], pct(n[BLOQUEO]))
+
+    # de los válidos, cuántos vinieron con campos en blanco
+    if por_estado[OK]:
+        incompletos = {c: sum(1 for ruc, _ in por_estado[OK] if not ultimas[ruc][0].get(c))
+                       for c in CAMPOS_CLIENTE if c != "cliente"}
+        log.info("[métricas]   Válidos sin: %s",
+                 ", ".join(f"{c} {k}" for c, k in incompletos.items()))
+
+    # el motivo concreto dentro de cada grupo, y qué RUCs son
+    for est, titulo in ((SIN_DATOS, "Vacíos por falta de datos"), (FALLO, "Vacíos por fallo del robot"),
+                        (BLOQUEO, "Bloqueados")):
+        lista = por_estado[est]
+        if not lista:
+            continue
+        motivos = {}
+        for _, det in lista:
+            motivos[det or "(sin detalle)"] = motivos.get(det or "(sin detalle)", 0) + 1
+        log.info("[métricas] %s (%d):", titulo, len(lista))
+        for det, k in sorted(motivos.items(), key=lambda x: -x[1]):
+            log.info("[métricas]     %4d  %s", k, det[:100])
+        rucs = [ruc for ruc, _ in lista]
+        resto = f" ... y {len(rucs) - max_listado} más" if len(rucs) > max_listado else ""
+        log.info("[métricas]   RUCs: %s%s", ", ".join(rucs[:max_listado]), resto)
+    if total - n[OK]:
+        log.info("[métricas] (filtra la columna 'estado_ruc' o 'estado' del CSV para ver todos los RUCs)")
+
+    return {e: [ruc for ruc, _ in v] for e, v in por_estado.items()}
+
+
+def ultimo_ruc_csv(ruta=ARCHIVO_CSV):
+    """El RUC de la última fila del CSV (donde se quedó la ejecución anterior), o None."""
+    archivo = Path(ruta)
+    if not archivo.exists():
+        return None
+    ultimo = None
+    with open(archivo, newline="", encoding="utf-8-sig") as f:
+        filas = csv.reader(f)
+        next(filas, None)                     # cabecera
+        for fila in filas:
+            if fila and fila[0].strip():
+                ultimo = fila[0].strip()
+    return ultimo
+
+
+_caidas_por_ruc = {}                          # ruc -> veces que se cerró el navegador con él
+
+
+def _caida_con_ruc(ruc, error):
+    """El navegador se cerró buscando 'ruc'. Si ya pasó MAX_CAIDAS_POR_RUC veces, lo guardo como
+    FALLO para no quedar atascado en él. Siempre lanza NavegadorCerrado."""
+    _caidas_por_ruc[ruc] = _caidas_por_ruc.get(ruc, 0) + 1
+    veces = _caidas_por_ruc[ruc]
+    if veces >= MAX_CAIDAS_POR_RUC:
+        log.warning("[8/8] %s: el navegador se cerró %d veces con este RUC; lo guardo como %s.",
+                    ruc, veces, FALLO)
+        guardar_fila_csv(ruc, None, FALLO, f"el navegador se cerró {veces} veces con este RUC")
+    raise NavegadorCerrado(f"se cerró el navegador buscando {ruc} ({type(error).__name__}: {error})"[:300])
 
 
 def buscar_lote(driver, handle_portal, handle_siac, valores=None):
     """Busca en SIAC cada valor del Excel, uno tras otro.
 
+    Retoma donde se quedó: si el CSV ya tiene filas, empieza en el RUC que sigue al último guardado.
     Tras guardar cada valor en el CSV cierra todas las ventanas (incluida la de SIAC Único),
     vuelve al portal y hace clic otra vez en SIAC Único para el siguiente valor."""
     valores = leer_valores() if valores is None else valores
@@ -1182,18 +1364,33 @@ def buscar_lote(driver, handle_portal, handle_siac, valores=None):
         return
 
     total = len(valores)
-    log.info("[8/8] Lote de %d búsquedas. Resultados -> %s", total, Path(ARCHIVO_CSV).resolve())
+    inicio = 0
+    ultimo = ultimo_ruc_csv()
+    if ultimo in valores:
+        inicio = valores.index(ultimo) + 1
+        log.info("[8/8] El CSV terminó en %s (%d/%d); retomo desde el siguiente.", ultimo, inicio, total)
+    elif ultimo:
+        log.warning("[8/8] El último RUC del CSV (%s) no está en el Excel; empiezo desde el primero.", ultimo)
+    if inicio >= total:
+        log.info("[8/8] Todos los valores del Excel ya están en el CSV; no hay nada que buscar.")
+        metricas_csv()
+        return
 
-    for i, valor in enumerate(valores, 1):
+    log.info("[8/8] Lote de %d búsquedas (quedan %d). Resultados -> %s",
+             total, total - inicio, Path(ARCHIVO_CSV).resolve())
+
+    for i, valor in enumerate(valores[inicio:], inicio + 1):
         log.info("[8/8] (%d/%d) --- %s ---", i, total, valor)
         try:
             handles_antes = driver.window_handles
             buscar_en_siac(driver, valor)
 
             datos = {}
+            estado, detalle = FALLO, ""
             popup = esperar_popup(driver, handles_antes)
             if popup is None:
                 log.warning("[8/8] (%d/%d) %s: no apareció el popup en %s s.", i, total, valor, TIMEOUT_POPUP)
+                detalle = f"no apareció el popup en {TIMEOUT_POPUP} s"
             else:
                 driver.switch_to.window(popup)
                 _esperar_carga(driver)
@@ -1226,26 +1423,53 @@ def buscar_lote(driver, handle_portal, handle_siac, valores=None):
                             cerrar_popup(driver, h, handle_siac)
                     driver.switch_to.window(handle_siac)      # la alerta ya cerró: vuelvo a SIAC
                     _esperar_carga(driver)
+                    estado, detalle = BLOQUEO, mensaje or "alerta"
                 elif contenido == "sin_ruc":
                     log.info("[8/8] (%d/%d) %s: Consulta de Clientes sin opción %r. Guardo vacío.",
                              i, total, valor, TIPO_DOC_CLIENTE)
+                    estado, detalle = SIN_DATOS, f"Consulta de Clientes sin opción {TIPO_DOC_CLIENTE}"
                 elif contenido == "vacio":
-                    log.info("[8/8] (%d/%d) %s: 'No existen datos'. Guardo vacío y paso al siguiente.",
+                    log.info("[8/8] (%d/%d) %s: popup sin productos. Cierro, guardo vacío y paso al siguiente.",
                              i, total, valor)
+                    estado, detalle = SIN_DATOS, "popup sin productos"
+                elif contenido is None:
+                    log.info("[8/8] (%d/%d) %s: el popup no mostró datos ni alerta a tiempo.", i, total, valor)
+                    detalle = f"el popup no cargó en {TIMEOUT_DATOS} s"
                 elif not filas:
                     log.info("[8/8] (%d/%d) %s: el popup vino vacío.", i, total, valor)
+                    estado, detalle = SIN_DATOS, "popup sin filas de servicios"
+                elif all(act == 0 and no == 0 for _, act, no in filas):
+                    log.info("[8/8] (%d/%d) %s: todas las filas tienen 0 activas y 0 no activas.",
+                             i, total, valor)
+                    estado, detalle = SIN_DATOS, "0 líneas activas y 0 no activas"
                 elif CLIC_EN_TOTAL_ACTIVAS:
-                    detalle = abrir_detalle_activas(driver, popup)
-                    if detalle and clic_primer_numero(driver, handle_siac):   # redirige a SIAC
+                    h_detalle = abrir_detalle_activas(driver, popup)
+                    if h_detalle is None:
+                        detalle = "no se abrió el detalle de líneas"
+                    elif not clic_primer_numero(driver, handle_siac):   # redirige a SIAC
+                        detalle = "el detalle no tenía número que clicar"
+                    else:
                         datos = leer_datos_cliente(driver)
-                        cerrar_popup(driver, detalle, handle_siac)   # cierro el detalle si sigue abierto
+                        cerrar_popup(driver, h_detalle, handle_siac)   # cierro el detalle si sigue abierto
+                        if datos.get("cliente"):
+                            estado, detalle = OK, ""
+                        else:
+                            detalle = "la ficha del cliente no mostró el nombre"
+                else:
+                    detalle = "CLIC_EN_TOTAL_ACTIVAS desactivado: no se lee la ficha"
                 cerrar_popup(driver, popup, handle_siac)
 
-            guardar_fila_csv(valor, datos)
-            log.info("[8/8] (%d/%d) %s guardado en el CSV.", i, total, valor)
+            if estado != OK and not _driver_vivo(driver):
+                # el "no encontré nada" fue porque se cerró el navegador: no lo guardo como vacío
+                raise NavegadorCerrado("el navegador se cerró durante la búsqueda")
+            guardar_fila_csv(valor, datos, estado, detalle)
+            log.info("[8/8] (%d/%d) %s guardado en el CSV: %s%s", i, total, valor, estado,
+                     f" ({detalle})" if detalle else "")
         except Exception as e:
-            log.warning("[8/8] (%d/%d) %s falló: %s. Guardo ERROR y sigo.", i, total, valor, e)
-            guardar_fila_csv(valor, "ERROR")
+            if not _driver_vivo(driver):
+                _caida_con_ruc(valor, e)      # lanza NavegadorCerrado: se reabre y se reintenta este RUC
+            log.warning("[8/8] (%d/%d) %s falló: %s. Lo guardo como %s y sigo.", i, total, valor, e, FALLO)
+            guardar_fila_csv(valor, None, FALLO, f"excepción: {type(e).__name__}: {e}"[:200])
 
         if i < total:
             # cierro todos los popups y SIAC Único, y lo abro de nuevo desde el portal
@@ -1255,10 +1479,11 @@ def buscar_lote(driver, handle_portal, handle_siac, valores=None):
                 time.sleep(PAUSA_ENTRE_BUSQUEDAS)
                 handle_siac = abrir_siac(driver)
             except Exception as e2:
-                log.error("[8/8] No pude reabrir SIAC: %s. Corto el lote.", e2)
-                break
+                # el RUC ya quedó guardado: al reabrir el navegador se sigue con el siguiente
+                raise NavegadorCerrado(f"no pude reabrir SIAC: {e2}") from e2
 
     log.info("[8/8] Lote terminado (%d valores). CSV: %s", total, Path(ARCHIVO_CSV).resolve())
+    metricas_csv()
 
 
 def _ventanas_vivas(driver):
@@ -1362,12 +1587,15 @@ def abrir_siac(driver, texto=TEXTO_OPCION):
     objetivo = texto.lower().translate(str.maketrans("áéíóúüñ", "aeiouun"))
     tr = f"translate(normalize-space(.),'{minus[0]}','{minus[1]}')"
     tr_attr = lambda a: f"translate(normalize-space(@{a}),'{minus[0]}','{minus[1]}')"
+    # Solo el elemento más interno con el texto: un <td>/<li> contenedor del menú también
+    # "contiene" el texto, y al clicar su centro caía en otro enlace (ej. SIVCO).
+    hoja = f"contains({tr},'{objetivo}') and not(.//*[contains({tr},'{objetivo}')])"
     xpath = (
-        f"//a[contains({tr},'{objetivo}')]"
-        f" | //button[contains({tr},'{objetivo}')]"
-        f" | //span[contains({tr},'{objetivo}')]"
-        f" | //td[contains({tr},'{objetivo}')]"
-        f" | //li[contains({tr},'{objetivo}')]"
+        f"//a[{hoja}]"
+        f" | //button[{hoja}]"
+        f" | //span[{hoja}]"
+        f" | //td[{hoja}]"
+        f" | //li[{hoja}]"
         f" | //*[contains({tr_attr('title')},'{objetivo}') or contains({tr_attr('alt')},'{objetivo}')]"
     )
     el = _buscar_en_frames(driver, xpath)
@@ -1380,7 +1608,8 @@ def abrir_siac(driver, texto=TEXTO_OPCION):
             f"Enlaces visibles: {', '.join(enlaces) or 'ninguno (¿el portal cargó?)'}"
         )
 
-    log.info("[7/8] Portal: clic en %r", el.text.strip() or texto)
+    log.info("[7/8] Portal: clic en <%s> %r (href=%s)", el.tag_name,
+             el.text.strip() or texto, el.get_attribute("href"))
     pestanas_antes = driver.window_handles
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     time.sleep(0.3)
@@ -1585,6 +1814,41 @@ def flujo_portal(url=URL_SELENIUM, opcion=TEXTO_OPCION):
     return driver
 
 
+def _descartar_navegador():
+    """Cierra lo que quede del navegador caído (libera el perfil para abrir otro)."""
+    global _driver_activo
+    if _driver_activo is not None:
+        try:
+            _driver_activo.quit()
+        except Exception:
+            pass                              # ya estaba muerto
+    _driver_activo = None
+    time.sleep(3)                             # que Chrome suelte el perfil (--user-data-dir)
+
+
+def flujo_con_reinicios(url=URL_SELENIUM, opcion=TEXTO_OPCION):
+    """flujo_portal(), pero si el navegador se cierra a mitad del proceso lo abre de nuevo desde
+    cero (portal -> credenciales -> SIAC) y el lote retoma desde el último RUC del CSV.
+    Se rinde tras MAX_REINICIOS_SIN_AVANCE reinicios seguidos sin guardar ningún RUC nuevo."""
+    sin_avance = 0
+    while True:
+        avance_antes = ultimo_ruc_csv()
+        try:
+            return flujo_portal(url, opcion)
+        except Exception as e:
+            if not isinstance(e, NavegadorCerrado) and _driver_vivo(_driver_activo):
+                raise                         # error con el navegador abierto: no lo tapo
+            sin_avance = 0 if ultimo_ruc_csv() != avance_antes else sin_avance + 1
+            if sin_avance >= MAX_REINICIOS_SIN_AVANCE:
+                log.error("[reinicio] %d reinicios seguidos sin avanzar; me rindo.", sin_avance)
+                raise
+            log.warning("[reinicio] %s", e if isinstance(e, NavegadorCerrado)
+                        else f"El navegador se cerró ({type(e).__name__}: {e})"[:300])
+            log.warning("[reinicio] Abro el navegador de nuevo y retomo desde el CSV "
+                        "(reinicios seguidos sin avance: %d/%d)...", sin_avance, MAX_REINICIOS_SIN_AVANCE)
+            _descartar_navegador()
+
+
 # --------------------------- cierre ---------------------------
 def cerrar_todo(driver):
     """Cierra el navegador. La VPN no se toca: la maneja una persona a mano."""
@@ -1606,7 +1870,13 @@ if __name__ == "__main__":
                     help="Guardar la contraseña del portal de distribuidores")
     ap.add_argument("--verificar-password", action="store_true",
                     help="Ver qué contraseña hay guardada y probarla contra el portal")
+    ap.add_argument("--metricas", action="store_true",
+                    help="Solo mostrar el resumen del CSV (válidos / vacíos / bloqueados)")
     args = ap.parse_args()
+
+    if args.metricas:
+        metricas_csv(max_listado=10**6)       # aquí sí lista todos los RUCs
+        sys.exit(0)
 
     codigo_salida = 0
     try:
@@ -1623,7 +1893,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
         # la VPN la conecta una persona a mano antes de ejecutar el script
-        flujo_portal()
+        flujo_con_reinicios()
         log.info("[fin] Proceso terminado; cerrando todo...")
 
     except KeyboardInterrupt:
@@ -1635,4 +1905,5 @@ if __name__ == "__main__":
     finally:
         cerrar_todo(_driver_activo)
     sys.exit(codigo_salida)
+
 
